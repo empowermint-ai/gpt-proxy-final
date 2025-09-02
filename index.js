@@ -1,92 +1,125 @@
 import express from "express";
-import dotenv from "dotenv";
 import cors from "cors";
-import fetch from "node-fetch";
+import dotenv from "dotenv";
+import { OpenAI } from "openai";
 
 dotenv.config();
+
 const app = express();
-const port = process.env.PORT || 8080;
 
-app.use(cors());
-app.use(express.json());
+// ---- CORS (dev + prod frontends) ----
+// Only uses built-in deps (no extras) to avoid build issues.
+const ALLOWLIST = ["http://localhost:5173", "https://empowermint-pwa.vercel.app"];
+const corsOptions = {
+  origin(origin, cb) {
+    // allow non-browser tools like curl/postman (no Origin header)
+    if (!origin) return cb(null, true);
+    return cb(null, ALLOWLIST.includes(origin));
+  },
+  methods: ["POST", "OPTIONS", "GET"],
+  allowedHeaders: ["Content-Type"],
+};
+app.use(cors(corsOptions));
+// explicit preflight for all routes (esp. /ask)
+app.options("*", cors(corsOptions));
 
-app.get("/", (req, res) => {
-  res.send("empowermint GPT proxy is live.");
+// ---- Body parsing ----
+app.use(express.json({ limit: "1mb" }));
+
+// ---- Utils ----
+const cleanText = (txt = "") =>
+  (txt || "")
+    .replace(/\*\*/g, "")
+    .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, "($1 / $2)")
+    .replace(/\\text\{([^}]+)\}/g, "$1")
+    .replace(/\\\[|\]/g, "")
+    .replace(/\\\(|\\\)/g, "")
+    .trim();
+
+// ---- Health & helpful routes ----
+app.get("/", (_req, res) => {
+  res.json({
+    ok: true,
+    name: "empowermint-gpt-proxy",
+    endpoints: ["POST /ask", "GET /healthz"],
+  });
 });
 
-// ✅ Custom system prompt based on mode
-function getSystemPrompt(mode) {
-  if (mode === "exam") {
-    return `
-You are EB, a motivational study coach and tutor from empowermint 🌱.
-Answer this Grade 12 Accounting, Math, or Science question like you're helping a learner before an exam:
-- Be clear, calm, and encouraging 🧘
-- Break things down step-by-step ➗
-- Use relatable real-life examples 💡
-- Explain any formula in plain words: e.g. (Cost - Value) ÷ Life
-- End with a summary tip or what to revise next 🎯
-- Use emojis to keep it warm, not robotic — but don't overdo it.
+app.get("/healthz", (_req, res) => {
+  const ok = Boolean(process.env.OPENAI_API_KEY);
+  res.status(ok ? 200 : 500).json({
+    ok,
+    openaiKey: ok ? "present" : "missing",
+  });
+});
 
-Always speak with empathy and empowerment. Make the learner feel they can do this 💪.
-    `;
-  }
-
-  if (mode === "tldr") {
-    return `
-You are EB, a smart but supportive AI tutor from empowermint 🌱.
-Give a short, simple, practical answer in plain English:
-- Use bullet points ✅
-- Use plain math (e.g. Total ÷ Units)
-- Add a few emojis that match the vibe ✨
-- End with a quick motivational nudge 🙌
-
-You are not overly formal. You sound like a helpful friend who knows their stuff.
-    `;
-  }
-
-  return "You are a helpful tutor from empowermint.";
+// ---- OpenAI client ----
+if (!process.env.OPENAI_API_KEY) {
+  console.warn("⚠️ OPENAI_API_KEY is not set. /healthz will return 500 until it is configured.");
 }
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// ---- Main endpoint ----
 app.post("/ask", async (req, res) => {
-  const { question, mode } = req.body;
-
-  if (!question || !mode) {
-    return res.status(400).json({ error: "Missing question or mode" });
-  }
-
-  const systemPrompt = getSystemPrompt(mode);
-
   try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: question },
-        ],
-        temperature: 0.7,
-      }),
-    });
+    const { prompt, mode } = req.body || {};
 
-    const data = await response.json();
-    const answer = data?.choices?.[0]?.message?.content;
-
-    if (!answer) {
-      throw new Error("No valid response from OpenAI");
+    if (!prompt || typeof prompt !== "string") {
+      return res.status(400).json({ error: "Missing prompt" });
+    }
+    if (!mode || (mode !== "exam" && mode !== "tldr")) {
+      return res.status(400).json({ error: "Missing or invalid mode (exam|tldr)" });
     }
 
-    res.status(200).json({ ok: true, answer, mode });
+    const promptTrim = prompt.trim();
+    if (!promptTrim.length) {
+      return res.status(400).json({ error: "Empty prompt" });
+    }
+    if (promptTrim.length > 4000) {
+      return res.status(400).json({ error: "Prompt too long (max 4000 chars)" });
+    }
+
+    const systemPrompt =
+      mode === "exam"
+        ? "You are EB, a structured study coach for high school learners. Output plain text only. No Markdown, no LaTeX, no code fences. Be step-by-step, practical, and concise."
+        : "You are EB, a motivational coach giving TL;DR summaries for high school learners. Output plain text only. No Markdown, no LaTeX. Keep it crisp and inspiring.";
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: promptTrim },
+      ],
+      temperature: 0.7,
+    });
+
+    const raw = completion?.choices?.[0]?.message?.content || "";
+    const answer = cleanText(raw);
+    return res.json({ answer });
   } catch (err) {
-    console.error("GPT error:", err.message);
-    res.status(500).json({ error: "GPT error", details: err.message });
+    console.error("Error in /ask:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ error: "Server error processing request" });
   }
 });
 
-app.listen(port, () => {
-  console.log(`empowermint GPT proxy is running on port ${port}`);
+// Helpful 405 for accidental GETs on /ask
+app.get("/ask", (_req, res) => {
+  res.status(405).json({ error: "Use POST /ask with JSON { prompt, mode }" });
 });
+
+// ---- 404 handler ----
+app.use((req, res) => {
+  res.status(404).json({
+    error: "Not found",
+    hint: "POST /ask with JSON { prompt, mode:'exam'|'tldr' }",
+  });
+});
+
+// ---- Error handler ----
+app.use((err, _req, res, _next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`empowermint GPT Proxy running on port ${PORT}`));
