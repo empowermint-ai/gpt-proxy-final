@@ -8,19 +8,16 @@ dotenv.config();
 const app = express();
 
 // ---- CORS (dev + prod frontends) ----
-// Only uses built-in deps (no extras) to avoid build issues.
 const ALLOWLIST = ["http://localhost:5173", "https://empowermint-pwa.vercel.app"];
 const corsOptions = {
   origin(origin, cb) {
-    // allow non-browser tools like curl/postman (no Origin header)
-    if (!origin) return cb(null, true);
+    if (!origin) return cb(null, true); // allow curl/postman
     return cb(null, ALLOWLIST.includes(origin));
   },
   methods: ["POST", "OPTIONS", "GET"],
   allowedHeaders: ["Content-Type"],
 };
 app.use(cors(corsOptions));
-// explicit preflight for all routes (esp. /ask)
 app.options("*", cors(corsOptions));
 
 // ---- Body parsing ----
@@ -79,10 +76,11 @@ app.post("/ask", async (req, res) => {
       return res.status(400).json({ error: "Prompt too long (max 4000 chars)" });
     }
 
+    // ✨ Tone aligned to empowermint: friendly, motivating, plain text, light emojis.
     const systemPrompt =
       mode === "exam"
-        ? "You are EB, a structured study coach for high school learners. Output plain text only. No Markdown, no LaTeX, no code fences. Be step-by-step, practical, and concise."
-        : "You are EB, a motivational coach giving TL;DR summaries for high school learners. Output plain text only. No Markdown, no LaTeX. Keep it crisp and inspiring.";
+        ? "You are EB, a friendly, structured study coach for high school learners from empowermint. Use clear plain text only (no Markdown or LaTeX). Keep answers practical and step-by-step with short sentences. Use at most 2 suitable emojis to encourage or highlight key ideas (e.g., ✅, 💡, 📌). Length target: about 120–180 words. Finish with 1 quick tip."
+        : "You are EB from empowermint. Give a plain-text TL;DR in 3–6 crisp bullet-style lines separated by new lines (no dashes or numbering). No Markdown/LaTeX. Use up to 2 helpful emojis total. Length target: about 60–90 words. Keep it motivating and clear.";
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o",
