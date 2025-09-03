@@ -1,123 +1,140 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import { OpenAI } from "openai";
+/**
+ * Empowermint GPT Proxy (Render-friendly)
+ * - Route: POST /ask  ->  { answer }
+ * - CORS: localhost:5173 and empowermint-pwa.vercel.app
+ * - OpenAI v4 syntax
+ * - Strips LaTeX and **bold** markdown from responses
+ */
 
-dotenv.config();
+const express = require("express");
+const cors = require("cors");
+const OpenAI = require("openai");
 
 const app = express();
 
-// ---- CORS (dev + prod frontends) ----
-const ALLOWLIST = ["http://localhost:5173", "https://empowermint-pwa.vercel.app"];
-const corsOptions = {
-  origin(origin, cb) {
-    if (!origin) return cb(null, true); // allow curl/postman
-    return cb(null, ALLOWLIST.includes(origin));
-  },
-  methods: ["POST", "OPTIONS", "GET"],
-  allowedHeaders: ["Content-Type"],
-};
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+// --- CORS (allow local dev + prod PWA) ---
+const ALLOWED_ORIGINS = [
+  "http://localhost:5173",
+  "https://empowermint-pwa.vercel.app",
+];
 
-// ---- Body parsing ----
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Allow non-browser tools (no origin) and whitelisted origins
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+  })
+);
 app.use(express.json({ limit: "1mb" }));
 
-// ---- Utils ----
-const cleanText = (txt = "") =>
-  (txt || "")
-    .replace(/\*\*/g, "")
-    .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, "($1 / $2)")
-    .replace(/\\text\{([^}]+)\}/g, "$1")
-    .replace(/\\\[|\]/g, "")
-    .replace(/\\\(|\\\)/g, "")
-    .trim();
-
-// ---- Health & helpful routes ----
+// --- Health check ---
 app.get("/", (_req, res) => {
-  res.json({
-    ok: true,
-    name: "empowermint-gpt-proxy",
-    endpoints: ["POST /ask", "GET /healthz"],
-  });
+  res.status(200).send("empowermint gpt proxy is healthy ✅");
 });
 
-app.get("/healthz", (_req, res) => {
-  const ok = Boolean(process.env.OPENAI_API_KEY);
-  res.status(ok ? 200 : 500).json({
-    ok,
-    openaiKey: ok ? "present" : "missing",
-  });
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
-// ---- OpenAI client ----
-if (!process.env.OPENAI_API_KEY) {
-  console.warn("⚠️ OPENAI_API_KEY is not set. /healthz will return 500 until it is configured.");
+// --- Helpers ---
+function stripFormatting(text = "") {
+  let out = text;
+
+  // Remove Markdown bold/italics/backticks
+  out = out.replace(/\*\*(.*?)\*\*/g, "$1");
+  out = out.replace(/\*(.*?)\*/g, "$1");
+  out = out.replace(/`{1,3}([\s\S]*?)`{1,3}/g, "$1");
+
+  // Remove common LaTeX markers
+  out = out.replace(/\\\[|\\\]|\$\$|\$/g, "");
+  // Remove \text{...} but keep inner text
+  out = out.replace(/\\text\s*\{([^}]*)\}/g, "$1");
+  // Remove \frac{a}{b} -> (a) / (b)
+  out = out.replace(/\\frac\s*\{([^}]*)\}\s*\{([^}]*)\}/g, "($1) / ($2)");
+  // Generic brace-cleanup for leftover TeX environments
+  out = out.replace(/\\[a-zA-Z]+\s*\{([^}]*)\}/g, "$1");
+  // Collapse multiple spaces
+  out = out.replace(/[ \t]{2,}/g, " ");
+  // Tidy up stray backslashes
+  out = out.replace(/\\+/g, "");
+
+  return out.trim();
 }
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---- Main endpoint ----
+function buildSystemPrompt(mode = "exam") {
+  const base = `
+You are "EB" — the patient, encouraging tutor in the empowermint PWA for South African high school learners (CAPS/IEB).
+Tone: supportive, clear, step-by-step, culturally aware, and action-oriented. Avoid LaTeX, avoid bold markdown.
+Use simple ASCII when showing formulas, e.g. (Cost - Residual) / Useful life.
+
+ALWAYS follow this structure:
+1) Quick Summary (1–2 lines)
+2) Step-by-Step Solution (numbered steps, plain text)
+3) Key Formula(s) in simple ASCII
+4) Common Mistakes & Tips (2–4 bullets)
+5) If relevant: Mini Practice (1 short practice question, no answer)
+
+Rules:
+- DO NOT output LaTeX (no \\frac, \\text, \\[ \\], or $...$).
+- DO NOT use **bold** or markdown tables.
+- Prefer clear headings with plain text like "Summary:", "Steps:", etc.
+- Stay within the SA CAPS/IEB syllabus where applicable.
+  `.trim();
+
+  const exam = `
+When mode = "exam", be thorough and methodical. Show working and reasoning clearly.
+  `.trim();
+
+  const tldr = `
+When mode = "tldr", give a crisp, high-yield explanation first, then a compact set of steps.
+  `.trim();
+
+  return `${base}\n\n${mode === "tldr" ? tldr : exam}`;
+}
+
+// --- Route: POST /ask ---
 app.post("/ask", async (req, res) => {
   try {
     const { prompt, mode } = req.body || {};
-
-    if (!prompt || typeof prompt !== "string") {
-      return res.status(400).json({ error: "Missing prompt" });
-    }
-    if (!mode || (mode !== "exam" && mode !== "tldr")) {
-      return res.status(400).json({ error: "Missing or invalid mode (exam|tldr)" });
+    if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
+      return res.status(400).json({ error: "Missing 'prompt' string." });
     }
 
-    const promptTrim = prompt.trim();
-    if (!promptTrim.length) {
-      return res.status(400).json({ error: "Empty prompt" });
-    }
-    if (promptTrim.length > 4000) {
-      return res.status(400).json({ error: "Prompt too long (max 4000 chars)" });
-    }
+    const system = buildSystemPrompt((mode || "exam").toLowerCase());
 
-    // ✨ Tone aligned to empowermint: friendly, motivating, plain text, light emojis.
-    const systemPrompt =
-      mode === "exam"
-        ? "You are EB, a friendly, structured study coach for high school learners from empowermint. Use clear plain text only (no Markdown or LaTeX). Keep answers practical and step-by-step with short sentences. Use at most 2 suitable emojis to encourage or highlight key ideas (e.g., ✅, 💡, 📌). Length target: about 120–180 words. Finish with 1 quick tip."
-        : "You are EB from empowermint. Give a plain-text TL;DR in 3–6 crisp bullet-style lines separated by new lines (no dashes or numbering). No Markdown/LaTeX. Use up to 2 helpful emojis total. Length target: about 60–90 words. Keep it motivating and clear.";
-
-    const completion = await openai.chat.completions.create({
+    const completion = await client.chat.completions.create({
       model: "gpt-4o",
+      temperature: 0.3,
+      max_tokens: 1000,
       messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: promptTrim },
+        { role: "system", content: system },
+        {
+          role: "user",
+          content:
+            prompt +
+            "\n\nRemember: No LaTeX, no bold markdown. Use simple ASCII only.",
+        },
       ],
-      temperature: 0.7,
     });
 
-    const raw = completion?.choices?.[0]?.message?.content || "";
-    const answer = cleanText(raw);
-    return res.json({ answer });
+    const raw =
+      completion?.choices?.[0]?.message?.content?.toString() || "No answer.";
+    const answer = stripFormatting(raw);
+
+    return res.status(200).json({ answer });
   } catch (err) {
-    console.error("Error in /ask:", err?.response?.data || err?.message || err);
-    return res.status(500).json({ error: "Server error processing request" });
+    console.error("Error in /ask:", err?.response?.data || err);
+    // Try to give a friendly error
+    const friendly =
+      "Sorry — I couldn't generate a response right now. Please try again.";
+    return res.status(500).json({ error: friendly });
   }
 });
 
-// Helpful 405 for accidental GETs on /ask
-app.get("/ask", (_req, res) => {
-  res.status(405).json({ error: "Use POST /ask with JSON { prompt, mode }" });
-});
-
-// ---- 404 handler ----
-app.use((req, res) => {
-  res.status(404).json({
-    error: "Not found",
-    hint: "POST /ask with JSON { prompt, mode:'exam'|'tldr' }",
-  });
-});
-
-// ---- Error handler ----
-app.use((err, _req, res, _next) => {
-  console.error("Unhandled error:", err);
-  res.status(500).json({ error: "Internal server error" });
-});
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`empowermint GPT Proxy running on port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`empowermint gpt proxy listening on :${PORT}`)
+);
